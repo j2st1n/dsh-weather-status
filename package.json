@@ -1,0 +1,54 @@
+{
+  "name": "dsh-weather-status",
+  "version": "0.1.0",
+  "description": "Weather status capsule & forecast panel for DeepSeek Harness: topmost sidebar action, Open-Meteo integration, auto-location, and dark/light theme support",
+  "type": "module",
+  "license": "MIT",
+  "author": "j2st1n <github@3313107.xyz>",
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "weather",
+    "sidebar-capsule",
+    "weather-widget",
+    "weather-status",
+    "open-meteo"
+  ],
+  "exports": {
+    ".": "./src/index.js",
+    "./client": "./src/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src",
+    "cordis.patch.yml",
+    "ARCHITECTURE.md",
+    "docs",
+    "LICENSE",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": []
+    }
+  },
+  "dependencies": {},
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/j2st1n/dsh-weather-status.git"
+  },
+  "homepage": "https://github.com/j2st1n/dsh-weather-status#readme",
+  "bugs": "https://github.com/j2st1n/dsh-weather-status/issues",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "node -c src/index.js src/client.js",
+    "test": "node test/weather-verification.test.js"
+  }
+}

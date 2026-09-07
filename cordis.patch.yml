@@ -1,0 +1,6 @@
+# dsh-weather-status bundle patch: adds the host weather proxy & cache service.
+# The client half joins the browser graph automatically because package.json declares
+# dsh.client and exports "./client".
+- insert:
+    - id: weather
+      name: dsh-weather-status

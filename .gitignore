@@ -1,0 +1,8 @@
+# 依赖与产物
+node_modules/
+*.tgz
+
+# 本地系统与编辑痕迹
+.DS_Store
+*.log
+.npm-cache/
