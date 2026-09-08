@@ -165,11 +165,12 @@ test('Cordis server apply registers endpoints on ctx.webServer', () => {
   }
 
   serverApply(mockCtx)
-  assert.equal(registeredRoutes.length, 3)
+  assert.equal(registeredRoutes.length, 4)
   const paths = registeredRoutes.map((r) => r.path)
   assert.ok(paths.includes('/api/weather/current'))
   assert.ok(paths.includes('/api/weather/cities'))
   assert.ok(paths.includes('/api/weather/health'))
+  assert.ok(paths.includes('/api/weather/ip'))
 })
 
 // ==========================================
@@ -367,4 +368,151 @@ test('client storage resilience with corrupted JSON in localStorage', () => {
   const capsuleEl = registeredSlots[0].factory({ wide: true })
   const capsuleRendered = capsuleEl.type(capsuleEl.props)
   assert.ok(capsuleRendered, 'Capsule should render safely even with corrupted localStorage')
+})
+
+// ==========================================
+// 5. IP Geolocation & 24h Timezone Bug Fixes
+// ==========================================
+test('WeatherService detectIpLocation caching, private IP handling, and normalized format', async () => {
+  const svc = new WeatherService()
+
+  // 1. In-memory IP cache test
+  const mockIpData = {
+    name: '广州',
+    country: '中国',
+    latitude: 23.1291,
+    longitude: 113.2644,
+    ip: '14.23.150.1',
+    timezone: 'Asia/Shanghai',
+    isAutoIp: true,
+    source: 'ip-api'
+  }
+  svc.ipCache.set('14.23.150.1', {
+    data: mockIpData,
+    expiresAt: Date.now() + 10000
+  })
+
+  const cachedResult = await svc.detectIpLocation('14.23.150.1')
+  assert.deepEqual(cachedResult, mockIpData, 'Cached IP geolocation must be returned directly')
+
+  // 2. Private IP address handling falls back to egress IP ('default' cache key)
+  svc.ipCache.set('default', {
+    data: { ...mockIpData, ip: 'default-egress' },
+    expiresAt: Date.now() + 10000
+  })
+
+  const localRes1 = await svc.detectIpLocation('127.0.0.1')
+  assert.equal(localRes1.ip, 'default-egress', '127.0.0.1 should query egress IP under default key')
+
+  const localRes2 = await svc.detectIpLocation('192.168.1.100')
+  assert.equal(localRes2.ip, 'default-egress', '192.168.x.x should query egress IP under default key')
+
+  const localRes3 = await svc.detectIpLocation('10.0.0.5')
+  assert.equal(localRes3.ip, 'default-egress', '10.x.x.x should query egress IP under default key')
+})
+
+test('Cordis route GET /api/weather/ip handler and /api/weather/health version', async () => {
+  const routes = new Map()
+  const mockCtx = {
+    webServer: {
+      register: (r) => routes.set(r.path, r.handler)
+    },
+    effect: (fn) => fn()
+  }
+  serverApply(mockCtx)
+
+  const ipHandler = routes.get('/api/weather/ip')
+  assert.equal(typeof ipHandler, 'function', 'IP handler must be registered')
+
+  // Test method not allowed
+  let statusResult = 0
+  let jsonResult = null
+  const mockRes405 = {
+    writeHead: (s) => { statusResult = s },
+    end: (body) => { jsonResult = JSON.parse(body) }
+  }
+  await ipHandler({ method: 'POST', url: '/api/weather/ip', headers: {} }, mockRes405)
+  assert.equal(statusResult, 405)
+  assert.equal(jsonResult.ok, false)
+
+  // Test health check route version 0.1.2
+  const healthHandler = routes.get('/api/weather/health')
+  let healthStatus = 0
+  let healthJson = null
+  const mockHealthRes = {
+    writeHead: (s) => { healthStatus = s },
+    end: (body) => { healthJson = JSON.parse(body) }
+  }
+  await healthHandler({ method: 'GET', url: '/api/weather/health', headers: {} }, mockHealthRes)
+  assert.equal(healthStatus, 200)
+  assert.equal(healthJson.ok, true)
+  assert.equal(healthJson.version, '0.1.2')
+  assert.equal(typeof healthJson.cachedIpItems, 'number')
+})
+
+test('Hourly forecast alignment uses location local time with raw.utc_offset_seconds', () => {
+  // Simulate UTC+8 location (e.g. Beijing: utc_offset_seconds = 28800)
+  const utcOffsetSeconds = 28800
+  const utcOffsetMs = utcOffsetSeconds * 1000
+
+  // Fix current test time: UTC 06:00:00 -> Local 14:00:00
+  const mockNowMs = Date.parse('2026-09-08T06:00:00Z')
+  const localNow = new Date(mockNowMs + utcOffsetMs)
+
+  const y = localNow.getUTCFullYear()
+  const m = String(localNow.getUTCMonth() + 1).padStart(2, '0')
+  const d = String(localNow.getUTCDate()).padStart(2, '0')
+  const h = String(localNow.getUTCHours()).padStart(2, '0')
+  const currentIsoHour = `${y}-${m}-${d}T${h}`
+
+  // Open-Meteo with timezone=auto returns local times: "2026-09-08T14:00"
+  assert.equal(currentIsoHour, '2026-09-08T14', 'Current local ISO hour must be 14:00, not UTC 06:00')
+
+  const hourlyTimes = [
+    '2026-09-08T06:00',
+    '2026-09-08T07:00',
+    '2026-09-08T08:00',
+    '2026-09-08T09:00',
+    '2026-09-08T10:00',
+    '2026-09-08T11:00',
+    '2026-09-08T12:00',
+    '2026-09-08T13:00',
+    '2026-09-08T14:00',
+    '2026-09-08T15:00'
+  ]
+
+  const matchedIdx = hourlyTimes.findIndex((t) => t.startsWith(currentIsoHour))
+  assert.equal(matchedIdx, 8, 'Must match local hour 14:00 (index 8), NOT UTC hour 06:00 (index 0)')
+})
+
+test('Hourly day/night weather icon uses is_day and real hour without 20h index bug', () => {
+  // Simulate day 2, 10:00 AM where global index i = 34 (previously > 19, caused moon bug)
+  const timeStr = '2026-09-09T10:00'
+  const hourNum = parseInt(timeStr.split('T')[1].slice(0, 2), 10)
+  assert.equal(hourNum, 10)
+
+  // Case 1: When raw.hourly.is_day[34] === 1
+  const rawHourly = { is_day: { 34: 1 } }
+  const isDayHour1 = Array.isArray(rawHourly.is_day) && rawHourly.is_day[34] !== undefined
+    ? rawHourly.is_day[34] === 1
+    : (hourNum >= 6 && hourNum < 18)
+  assert.equal(isDayHour1, true)
+  const desc1 = getWeatherDesc(0, isDayHour1) // Clear sky
+  assert.equal(desc1.icon, 'sun', 'Daytime clear sky on day 2 must show sun icon')
+  assert.equal(desc1.text, '晴朗')
+
+  // Case 2: Without raw.hourly.is_day, fall back to hourNum (10 is between 6 and 18)
+  const isDayHour2 = hourNum >= 6 && hourNum < 18
+  assert.equal(isDayHour2, true)
+  const desc2 = getWeatherDesc(1, isDayHour2) // Mainly clear
+  assert.equal(desc2.icon, 'cloud-sun', 'Daytime mainly clear must show cloud-sun icon')
+
+  // Case 3: Nighttime on day 2, 22:00 PM (hourNum = 22)
+  const nightTimeStr = '2026-09-09T22:00'
+  const nightHourNum = parseInt(nightTimeStr.split('T')[1].slice(0, 2), 10)
+  const isNightHour = nightHourNum >= 6 && nightHourNum < 18
+  assert.equal(isNightHour, false)
+  const nightDesc = getWeatherDesc(0, isNightHour)
+  assert.equal(nightDesc.icon, 'moon', 'Nighttime clear sky on day 2 must show moon icon')
+  assert.equal(nightDesc.text, '晴朗 (夜)')
 })

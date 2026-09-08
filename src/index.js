@@ -84,13 +84,27 @@ function formatWeekday(dateStr, index) {
   }
 }
 
+function isPrivateIp(ip) {
+  if (!ip || typeof ip !== 'string') return true
+  const trimmed = ip.trim()
+  if (!trimmed || trimmed === '127.0.0.1' || trimmed === '::1' || trimmed === 'localhost') return true
+  if (trimmed.startsWith('192.168.') || trimmed.startsWith('10.') || trimmed.startsWith('169.254.')) return true
+  const match172 = trimmed.match(/^172\.(\d+)\./)
+  if (match172) {
+    const sec = parseInt(match172[1], 10)
+    if (sec >= 16 && sec <= 31) return true
+  }
+  return false
+}
+
 /**
- * Weather Service with 30-min TTL in-memory caching.
+ * Weather Service with 30-min TTL in-memory caching and IP geolocation.
  */
 export class WeatherService {
   constructor(options = {}) {
     this.ttlMs = options.ttlMs || DEFAULT_CACHE_TTL_MS
     this.cache = new Map() // key: `${lat.toFixed(2)},${lon.toFixed(2)}` -> { data, expiresAt }
+    this.ipCache = new Map() // key: ip or 'default' -> { data, expiresAt }
   }
 
   getCacheKey(lat, lon) {
@@ -118,6 +132,111 @@ export class WeatherService {
 
   clearCache() {
     this.cache.clear()
+    this.ipCache.clear()
+  }
+
+  /**
+   * Detect client egress IP geolocation using multi-channel high-availability cascading.
+   */
+  async detectIpLocation(clientIp = '') {
+    const rawIp = typeof clientIp === 'string' ? clientIp.trim() : ''
+    const isPrivate = isPrivateIp(rawIp)
+    const targetIp = isPrivate ? '' : rawIp
+    const cacheKey = targetIp || 'default'
+
+    const cached = this.ipCache.get(cacheKey)
+    if (cached && Date.now() < cached.expiresAt) {
+      return cached.data
+    }
+
+    let result = null
+
+    // Channel 1: ip-api.com (free, high-speed, CN & global)
+    try {
+      const url = `http://ip-api.com/json/${targetIp ? encodeURIComponent(targetIp) : ''}?lang=zh-CN`
+      const res = await fetch(url, {
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+        headers: { Accept: 'application/json' }
+      })
+      if (res.ok) {
+        const d = await res.json()
+        if (d && d.status === 'success' && d.lat != null && d.lon != null) {
+          result = {
+            name: d.city || d.regionName || d.country || '本地位置',
+            country: d.country || '',
+            latitude: Number(d.lat),
+            longitude: Number(d.lon),
+            ip: d.query || targetIp,
+            timezone: d.timezone || 'auto',
+            isAutoIp: true,
+            source: 'ip-api'
+          }
+        }
+      }
+    } catch {}
+
+    // Channel 2: api.ip.sb/geoip
+    if (!result) {
+      try {
+        const url = `https://api.ip.sb/geoip/${targetIp ? encodeURIComponent(targetIp) : ''}`
+        const res = await fetch(url, {
+          signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+          headers: { Accept: 'application/json' }
+        })
+        if (res.ok) {
+          const d = await res.json()
+          if (d && d.latitude != null && d.longitude != null) {
+            result = {
+              name: d.city || d.region || d.country || '本地位置',
+              country: d.country || '',
+              latitude: Number(d.latitude),
+              longitude: Number(d.longitude),
+              ip: d.ip || targetIp,
+              timezone: d.timezone || 'auto',
+              isAutoIp: true,
+              source: 'ip.sb'
+            }
+          }
+        }
+      } catch {}
+    }
+
+    // Channel 3: ipwho.is
+    if (!result) {
+      try {
+        const url = `https://ipwho.is/${targetIp ? encodeURIComponent(targetIp) : ''}`
+        const res = await fetch(url, {
+          signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+          headers: { Accept: 'application/json' }
+        })
+        if (res.ok) {
+          const d = await res.json()
+          if (d && d.success !== false && d.latitude != null && d.longitude != null) {
+            result = {
+              name: d.city || d.region || d.country || '本地位置',
+              country: d.country || '',
+              latitude: Number(d.latitude),
+              longitude: Number(d.longitude),
+              ip: d.ip || targetIp,
+              timezone: d.timezone?.id || d.timezone || 'auto',
+              isAutoIp: true,
+              source: 'ipwho.is'
+            }
+          }
+        }
+      } catch {}
+    }
+
+    if (!result) {
+      throw new Error('All IP geolocation upstream channels failed')
+    }
+
+    this.ipCache.set(cacheKey, {
+      data: result,
+      expiresAt: Date.now() + 60 * 60 * 1000 // 1 hour TTL
+    })
+
+    return result
   }
 
   /**
@@ -143,7 +262,7 @@ export class WeatherService {
       }
     }
 
-    const apiUrl = `https://api.open-meteo.com/v1/forecast?latitude=${nLat}&longitude=${nLon}&current=temperature_2m,relative_humidity_2m,apparent_temperature,is_day,precipitation,weather_code,wind_speed_10m&hourly=temperature_2m,weather_code,precipitation_probability&daily=weather_code,temperature_2m_max,temperature_2m_min&timezone=auto&forecast_days=7`
+    const apiUrl = `https://api.open-meteo.com/v1/forecast?latitude=${nLat}&longitude=${nLon}&current=temperature_2m,relative_humidity_2m,apparent_temperature,is_day,precipitation,weather_code,wind_speed_10m&hourly=temperature_2m,weather_code,precipitation_probability,is_day&daily=weather_code,temperature_2m_max,temperature_2m_min&timezone=auto&forecast_days=7`
 
     const res = await fetch(apiUrl, {
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
@@ -160,15 +279,33 @@ export class WeatherService {
     const currentCode = raw.current?.weather_code ?? 0
     const currentDesc = getWeatherDesc(currentCode, isDay)
 
-    // Current hour index in hourly array
+    // Current hour index in hourly array aligned to location local time
     const hourlyTimes = raw.hourly?.time || []
     const hourlyTemps = raw.hourly?.temperature_2m || []
     const hourlyCodes = raw.hourly?.weather_code || []
     const hourlyPrecipProb = raw.hourly?.precipitation_probability || []
 
-    const currentIsoHour = new Date().toISOString().slice(0, 13) // "2026-09-08T14"
+    const utcOffsetMs = (raw.utc_offset_seconds ?? 0) * 1000
+    const localNow = new Date(Date.now() + utcOffsetMs)
+    const y = localNow.getUTCFullYear()
+    const m = String(localNow.getUTCMonth() + 1).padStart(2, '0')
+    const d = String(localNow.getUTCDate()).padStart(2, '0')
+    const h = String(localNow.getUTCHours()).padStart(2, '0')
+    const currentIsoHour = `${y}-${m}-${d}T${h}` // e.g. "2026-09-08T14"
+
     let startHourIdx = hourlyTimes.findIndex((t) => t.startsWith(currentIsoHour))
-    if (startHourIdx < 0) startHourIdx = 0
+    if (startHourIdx < 0) {
+      const nowMs = Date.now()
+      let minDiff = Infinity
+      startHourIdx = 0
+      for (let idx = 0; idx < hourlyTimes.length; idx++) {
+        const diff = Math.abs(Date.parse(hourlyTimes[idx] + 'Z') - (nowMs + utcOffsetMs))
+        if (diff < minDiff) {
+          minDiff = diff
+          startHourIdx = idx
+        }
+      }
+    }
 
     // Take next 24 hours
     const hourly = []
@@ -176,7 +313,13 @@ export class WeatherService {
       const timeStr = hourlyTimes[i] || ''
       const hourPart = timeStr.includes('T') ? timeStr.split('T')[1].slice(0, 5) : timeStr
       const code = hourlyCodes[i] ?? 0
-      const isDayHour = i >= 6 && i <= 19
+      let hourNum = 12
+      if (timeStr.includes('T')) {
+        hourNum = parseInt(timeStr.split('T')[1].slice(0, 2), 10)
+      }
+      const isDayHour = Array.isArray(raw.hourly?.is_day) && raw.hourly.is_day[i] !== undefined
+        ? raw.hourly.is_day[i] === 1
+        : (hourNum >= 6 && hourNum < 18)
       const desc = getWeatherDesc(code, isDayHour)
       hourly.push({
         time: i === startHourIdx ? '现在' : hourPart,
@@ -351,11 +494,38 @@ export function apply(ctx) {
     sendJson(res, 200, {
       ok: true,
       service: 'dsh-weather',
-      version: '0.1.0',
+      version: '0.1.2',
       cachedItems: service.cache.size,
+      cachedIpItems: service.ipCache.size,
       ttlMs: service.ttlMs,
       timestamp: Date.now()
     })
+  }
+
+  // 4. GET /api/weather/ip
+  async function handleWeatherIp(req, res) {
+    if (req.method !== 'GET') {
+      return sendJson(res, 405, { ok: false, error: { code: 'METHOD_NOT_ALLOWED', message: 'GET only' } })
+    }
+
+    try {
+      const url = new URL(req.url || '/', 'http://localhost')
+      const xForwardedFor = req.headers['x-forwarded-for']
+      const clientIp = (typeof xForwardedFor === 'string' ? xForwardedFor.split(',')[0].trim() : '') ||
+                       req.headers['x-real-ip'] ||
+                       url.searchParams.get('ip') ||
+                       ''
+      const data = await service.detectIpLocation(clientIp)
+      sendJson(res, 200, { ok: true, data })
+    } catch (err) {
+      sendJson(res, 500, {
+        ok: false,
+        error: {
+          code: 'IP_LOCATION_ERROR',
+          message: err instanceof Error ? err.message : String(err)
+        }
+      })
+    }
   }
 
   ctx.effect(() =>
@@ -379,6 +549,14 @@ export function apply(ctx) {
       kind: 'exact',
       path: '/api/weather/health',
       handler: handleWeatherHealth
+    })
+  )
+
+  ctx.effect(() =>
+    ctx.webServer.register({
+      kind: 'exact',
+      path: '/api/weather/ip',
+      handler: handleWeatherIp
     })
   )
 }

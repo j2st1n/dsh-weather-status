@@ -1,6 +1,6 @@
 {
   "name": "dsh-weather-status",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Weather status capsule & forecast panel for DeepSeek Harness: topmost sidebar action, Open-Meteo integration, auto-location, and dark/light theme support",
   "type": "module",
   "license": "MIT",

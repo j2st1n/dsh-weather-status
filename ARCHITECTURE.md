@@ -95,18 +95,31 @@ DSH 侧边栏支持展开 (`wide: true`, 宽度约 240px) 和收起折叠 (`wide
    - 查询参数：`name={keyword}&count=6&language=zh&format=json`
    - 返回包含：城市名、国家、省份/行政区、经度、纬度、时区。
 
-### 3.3 IP 自动定位与容错降级链路
-用户无需手动输入城市即可获得首屏天气。定位执行三级降级策略：
-1. **首选定位：`https://ipwho.is/`**
-   - 纯 HTTPS，响应极快（通常 <150ms），CORS 完全开放。
-   - 返回结构包含 `city`, `latitude`, `longitude`, `country`。
-2. **备选定位：`https://freeipapi.com/api/json/`**
-   - 备用免 Key HTTPS IP 定位服务。
-3. **兜底定位 (Fallback Defaults)**：
-   - 若处于断网、离线开发或 IP 定位被安全策略拦截，自动采用预设默认城市：
-     - 城市名：`北京` (Beijing)
-     - 经纬度：`lat: 39.9042, lon: 116.4074`
-   - 界面提供明显的“点击切换城市”指引，保证任何情况下 UI 不报错、不崩溃。
+### 3.3 IP 自动定位高可用双通道与容错降级链路
+
+#### 3.3.1 根因剖析：早期实现为何频繁掉落默认“北京”
+早期版本（v0.1.1 及以前）在客户端 `detectLocationByIp()` 中仅顺序请求境外服务（`ipwho.is` -> `freeipapi.com`），遭遇严重问题：
+1. **境外直连高延迟与丢包**：在国内常规网络环境下，`ipwho.is` 与 `freeipapi.com` 易受跨境路由拥塞、DNS 污染或防火墙干扰，超时率极高（单次 3000ms 超时，两次累计阻塞 6000ms）。
+2. **浏览器环境受限**：纯前端直连公网第三方 IP 接口极易被浏览器隐私防护（Tracking Protection）或去广告插件（AdBlock/uBlock）阻断，触发跨域/网络异常。
+3. **静默降级至默认北京**：两次异常均被 `catch` 吞没，直接 `return { ...DEFAULT_CITY, isAutoIp: true }`，造成用户明明在深圳/上海/广州甚至海外，却被“自动定位”到了默认北京（带有蓝色定位指示标，给用户造成“定位错误”的严重困惑）。
+
+#### 3.3.2 高可用架构设计：服务端代理 + 国内外多通道 + 智能时区兜底
+为彻底根除掉落北京的问题，重构为三级高可用定位矩阵：
+1. **第一级（首选）：本地服务端探测代理通道 `GET /api/weather/ip`**
+   - 客户端同源请求本地 DSH 后端，内网延迟 <5ms，**无跨域限制、无广告插件拦截、无 CORS 顾虑**。
+   - DSH 服务端（Node.js 端）执行多通道可靠探测（首选国内免 Key 且延迟极低的 `http://ip-api.com/json/?lang=zh-CN`，备用 `https://api.ip.sb/geoip`、`https://ipwho.is/`、`https://ipinfo.io/json`）。
+   - 服务端具备 IP 定位内存缓存（1 小时 TTL），降低公网上游调用频次，防止限流。
+2. **第二级（备用直连）：客户端多通道高速降级**
+   - 若本地服务端未启动或代理接口不可用，客户端启动快速备用链路：
+     - 通道 A：`https://api.ip.sb/geoip`（Anycast 全球加速，国内访问良好，支持 CORS）；
+     - 通道 B：`https://ipwho.is/`（境外备用）；
+     - 通道 C：`https://api.garinasset.com/ip/client`（国内集群部署备用）。
+   - 单通道超时设为 2500ms，快速失败不长久阻塞。
+3. **第三级（智能兜底）：浏览器时区智能映射**
+   - 仅当上述所有网络探测均无法连通时（如完全断网离线），才进入兜底逻辑。
+   - 读取浏览器时区 `Intl.DateTimeFormat().resolvedOptions().timeZone`：
+     - 若为中国时区（`Asia/Shanghai`, `Asia/Chongqing`, `Asia/Urumqi`, `Asia/Harbin`），兜底为北京，并标记降级标识；
+     - 若为其他国际时区（如 `Europe/Berlin`, `America/New_York`, `Asia/Tokyo`, `Asia/Singapore` 等），智能映射为该时区代表城市，避免海外用户被强设定为北京。
 
 ### 3.4 WMO 天气编码与中文语义及图标映射
 
@@ -122,6 +135,48 @@ DSH 侧边栏支持展开 (`wide: true`, 宽度约 240px) 和收起折叠 (`wide
 | `71, 73, 75` | 小雪 / 中雪 / 大雪 (Snow) | `snow` | 冰晶白蓝 `#e0f2fe` |
 | `80, 81, 82` | 阵雨 (Showers) | `showers` | 亮蓝 `#0284c7` |
 | `95, 96, 99` | 雷阵雨 / 雷暴 (Thunderstorm) | `thunderstorm` | 闪电紫 `#8b5cf6` |
+
+### 3.5 未来 24 小时逐小时预报时区精准对齐与日夜图标算法
+
+#### 3.5.1 根因剖析：UTC 偏移 8 小时与数组下标导致日夜颠倒
+在早期实现（`src/index.js` 与 `src/client.js`）中存在两个严重 Bug：
+1. **时区偏差 8 小时**：
+   - 早期代码使用 `const currentIsoHour = new Date().toISOString().slice(0, 13)`，生成的是 **UTC/零时区** 时间（例如北京时间 14:00 时，UTC 字符串为 `"2026-09-08T06"`）。
+   - 而 Open-Meteo API 查询带上了 `&timezone=auto`，返回的 `hourly.time` 是当地所在时区的本地时间（北京返回 `["2026-09-08T00:00", ... "2026-09-08T14:00", ...]`）。
+   - `hourlyTimes.findIndex((t) => t.startsWith(currentIsoHour))` 用 UTC 06:00 去匹配本地时间，直接匹配到了今天早晨 6 点，导致逐小时预报列表**整整向前错位了 8 个小时**！当前 14 点看到的“现在”实际上是早晨 6 点的数据。
+2. **数组索引 `i` 代替真实时刻判断日夜**：
+   - 早期代码写为 `const isDayHour = i >= 6 && i <= 19`。
+   - `i` 为 `hourlyTimes` 数组的全局下标（0 ~ 167，代表连续 7 天共 168 个小时）。
+   - 一旦 `i` 跨过 19（如 `startHourIdx` 在下午，遍历到第二天中午 `i = 28`），`28 >= 6 && 28 <= 19` 恒为 `false`！
+   - 导致第二天白天（早 8 点到晚 18 点）所有天气全部被错误判定为夜间，晴天显示月亮、多云显示夜间多云，图标逻辑彻底紊乱。
+
+#### 3.5.2 解决方案与数据对齐方案
+1. **本地时间精准定位起始小时 (`startHourIdx`)**：
+   - 利用 Open-Meteo 响应中的 `raw.utc_offset_seconds`（例如北京为 `28800`，即 +8h）：
+     ```javascript
+     const utcOffsetMs = (raw.utc_offset_seconds ?? 0) * 1000
+     const localNow = new Date(Date.now() + utcOffsetMs)
+     const y = localNow.getUTCFullYear()
+     const m = String(localNow.getUTCMonth() + 1).padStart(2, '0')
+     const d = String(localNow.getUTCDate()).padStart(2, '0')
+     const h = String(localNow.getUTCHours()).padStart(2, '0')
+     const currentLocalIsoHour = `${y}-${m}-${d}T${h}` // 精确生成当地本地当前小时，如 "2026-09-08T14"
+     ```
+   - 在 `hourlyTimes` 中查找 `t.startsWith(currentLocalIsoHour)`，精准定位当前小时为列表第一项（显示“现在”）。
+   - 若未查找到，备用方案取当前时间戳就近索引，确保永远不越界。
+2. **真实时刻与 Open-Meteo `is_day` 字段判定日夜 (`isDayHour`)**：
+   - 请求 Open-Meteo 时在 `hourly` 参数中追加 `is_day` 字段：
+     `&hourly=temperature_2m,weather_code,precipitation_probability,is_day`
+   - 优先依据 Open-Meteo 官方天文日落日出数据 `raw.hourly?.is_day?.[i] === 1`；
+   - 容错兜底解析时间字符串中的真实小时数 `hourNum`：
+     ```javascript
+     let hourNum = 12
+     if (timeStr.includes('T')) {
+       hourNum = parseInt(timeStr.split('T')[1].slice(0, 2), 10)
+     }
+     const isDayHour = raw.hourly?.is_day ? raw.hourly.is_day[i] === 1 : (hourNum >= 6 && hourNum < 18)
+     ```
+   - 彻底解决日夜颠倒问题，确保 24 小时横向滑动预报在任何时区、任何时间点均能精准展示白天与夜晚图标。
 
 ---
 
@@ -206,8 +261,28 @@ interface WeatherSettings {
 ```
 
 ### 4.2 服务端 Cordis 支持 (`src/index.js`)
-虽然客户端可直连 Open-Meteo，但在插件服务端（Cordis 服务端进程）同步提供可选的代理路由与配置接口：
-- `GET /api/weather/current`: 后端代理由 Node.js 发起请求，具备 Node 内存级缓存（30 分钟），在内网受限或无跨域环境时作为无缝透明备选。
+服务端作为 DSH 内核中运行的 Cordis 插件，具备免受浏览器 CORS、CSP 及广告拦截限制的天然优势，提供以下接口服务：
+- `GET /api/weather/ip`: **高可用 IP 出口与归属探测端点**
+  - 入参支持 `?ip=x.x.x.x`（可选），若不传则自动解析请求头 `x-forwarded-for` / `x-real-ip` 或探测服务端出口公网 IP；
+  - 服务端聚合探测链路：优先国内免 Key 高速接口 `http://ip-api.com/json/?lang=zh-CN`，备选 `https://api.ip.sb/geoip`、`https://ipwho.is/`、`https://ipinfo.io/json`；
+  - 具备 1 小时内存缓存（`ipCache`），有效保护上游接口额度；
+  - 返回标准结构：
+    ```json
+    {
+      "ok": true,
+      "data": {
+        "name": "天津",
+        "country": "中国",
+        "latitude": 39.0842,
+        "longitude": 117.2009,
+        "ip": "117.12.148.207",
+        "timezone": "Asia/Shanghai",
+        "isAutoIp": true,
+        "source": "ip-api"
+      }
+    }
+    ```
+- `GET /api/weather/current`: 后端气象数据代理由 Node.js 发起请求，具备 Node 内存级缓存（30 分钟），在内网受限或无跨域环境时作为无缝透明备选。
 - `GET /api/weather/cities?query=`: 后端城市搜索代理。
 - `GET /api/weather/health`: 健康检查端点，返回当前插件运行状态与缓存统计。
 

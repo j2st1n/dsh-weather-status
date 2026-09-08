@@ -384,10 +384,50 @@ window.__ModuleLoader__.load({
 
     // ---------- IP Geolocation Fetchers ----------
     async function detectLocationByIp() {
-      // 1. Try ipwho.is
+      // 1. Try local Cordis server proxy endpoint /api/weather/ip (zero CORS, intranet fast, no adblock)
+      try {
+        const res = await fetch('/api/weather/ip', {
+          signal: AbortSignal.timeout(2500),
+          headers: { Accept: 'application/json' }
+        })
+        if (res.ok) {
+          const json = await res.json()
+          if (json?.ok && json.data?.latitude && json.data?.longitude) {
+            return {
+              name: json.data.name || '本地位置',
+              country: json.data.country || '',
+              latitude: json.data.latitude,
+              longitude: json.data.longitude,
+              isAutoIp: true
+            }
+          }
+        }
+      } catch (err) {}
+
+      // 2. Direct Channel A: api.ip.sb/geoip (Anycast, CORS enabled, fast worldwide)
+      try {
+        const res = await fetch('https://api.ip.sb/geoip', {
+          signal: AbortSignal.timeout(2500),
+          headers: { Accept: 'application/json' }
+        })
+        if (res.ok) {
+          const d = await res.json()
+          if (d && d.latitude && d.longitude) {
+            return {
+              name: d.city || d.region || '本地位置',
+              country: d.country || '',
+              latitude: d.latitude,
+              longitude: d.longitude,
+              isAutoIp: true
+            }
+          }
+        }
+      } catch (err) {}
+
+      // 3. Direct Channel B: ipwho.is
       try {
         const res = await fetch('https://ipwho.is/', {
-          signal: AbortSignal.timeout(3000),
+          signal: AbortSignal.timeout(2500),
           headers: { Accept: 'application/json' }
         })
         if (res.ok) {
@@ -404,28 +444,20 @@ window.__ModuleLoader__.load({
         }
       } catch (err) {}
 
-      // 2. Try freeipapi.com
-      try {
-        const res = await fetch('https://freeipapi.com/api/json/', {
-          signal: AbortSignal.timeout(3000),
-          headers: { Accept: 'application/json' }
-        })
-        if (res.ok) {
-          const d = await res.json()
-          if (d && d.latitude && d.longitude) {
-            return {
-              name: d.cityName || '本地位置',
-              country: d.countryName || '',
-              latitude: d.latitude,
-              longitude: d.longitude,
-              isAutoIp: true
-            }
-          }
-        }
-      } catch (err) {}
+      // 4. Intelligent fallback based on browser timezone
+      const tz = (typeof Intl !== 'undefined' && Intl.DateTimeFormat) ? (Intl.DateTimeFormat().resolvedOptions().timeZone || '') : ''
+      if (tz.includes('Tokyo')) {
+        return { name: '东京', country: '日本', latitude: 35.6762, longitude: 139.6503, isAutoIp: true, isFallback: true }
+      }
+      if (tz.includes('Berlin') || tz.includes('Paris') || tz.includes('London')) {
+        return { name: '法兰克福', country: '德国', latitude: 50.1109, longitude: 8.6821, isAutoIp: true, isFallback: true }
+      }
+      if (tz.includes('New_York')) {
+        return { name: '纽约', country: '美国', latitude: 40.7128, longitude: -74.0060, isAutoIp: true, isFallback: true }
+      }
 
-      // 3. Fallback to Beijing
-      return { ...DEFAULT_CITY, isAutoIp: true }
+      // Default fallback
+      return { ...DEFAULT_CITY, isAutoIp: true, isFallback: true }
     }
 
     // ---------- Weather Fetch Pipeline ----------
@@ -452,7 +484,7 @@ window.__ModuleLoader__.load({
         // Try direct Open-Meteo
         let fetchedPayload = null
         try {
-          const directUrl = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,relative_humidity_2m,apparent_temperature,is_day,precipitation,weather_code,wind_speed_10m&hourly=temperature_2m,weather_code,precipitation_probability&daily=weather_code,temperature_2m_max,temperature_2m_min&timezone=auto&forecast_days=7`
+          const directUrl = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,relative_humidity_2m,apparent_temperature,is_day,precipitation,weather_code,wind_speed_10m&hourly=temperature_2m,weather_code,precipitation_probability,is_day&daily=weather_code,temperature_2m_max,temperature_2m_min&timezone=auto&forecast_days=7`
           const res = await fetch(directUrl, {
             signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
             headers: { Accept: 'application/json' }
@@ -465,25 +497,50 @@ window.__ModuleLoader__.load({
           const currentCode = raw.current?.weather_code ?? 0
           const currentDesc = getWeatherInfo(currentCode, isDay)
 
-          // Hourly next 24h
+          // Hourly next 24h aligned to local time
           const hourlyTimes = raw.hourly?.time || []
           const hourlyTemps = raw.hourly?.temperature_2m || []
           const hourlyCodes = raw.hourly?.weather_code || []
           const hourlyPrecipProb = raw.hourly?.precipitation_probability || []
 
-          const currentIsoHour = new Date().toISOString().slice(0, 13)
+          const utcOffsetMs = (raw.utc_offset_seconds ?? 0) * 1000
+          const localNow = new Date(Date.now() + utcOffsetMs)
+          const y = localNow.getUTCFullYear()
+          const m = String(localNow.getUTCMonth() + 1).padStart(2, '0')
+          const d = String(localNow.getUTCDate()).padStart(2, '0')
+          const h = String(localNow.getUTCHours()).padStart(2, '0')
+          const currentIsoHour = `${y}-${m}-${d}T${h}`
+
           let startHourIdx = hourlyTimes.findIndex((t) => t.startsWith(currentIsoHour))
-          if (startHourIdx < 0) startHourIdx = 0
+          if (startHourIdx < 0) {
+            const nowMs = Date.now()
+            let minDiff = Infinity
+            startHourIdx = 0
+            for (let idx = 0; idx < hourlyTimes.length; idx++) {
+              const diff = Math.abs(Date.parse(hourlyTimes[idx] + 'Z') - (nowMs + utcOffsetMs))
+              if (diff < minDiff) {
+                minDiff = diff
+                startHourIdx = idx
+              }
+            }
+          }
 
           const hourly = []
           for (let i = startHourIdx; i < Math.min(startHourIdx + 24, hourlyTimes.length); i++) {
             const timeStr = hourlyTimes[i] || ''
             const hourPart = timeStr.includes('T') ? timeStr.split('T')[1].slice(0, 5) : timeStr
             const code = hourlyCodes[i] ?? 0
-            const isDayHour = i >= 6 && i <= 19
+            let hourNum = 12
+            if (timeStr.includes('T')) {
+              hourNum = parseInt(timeStr.split('T')[1].slice(0, 2), 10)
+            }
+            const isDayHour = Array.isArray(raw.hourly?.is_day) && raw.hourly.is_day[i] !== undefined
+              ? raw.hourly.is_day[i] === 1
+              : (hourNum >= 6 && hourNum < 18)
             const desc = getWeatherInfo(code, isDayHour)
             hourly.push({
               time: i === startHourIdx ? '现在' : hourPart,
+              isoTime: timeStr,
               temperature: Math.round(hourlyTemps[i] ?? 0),
               weatherCode: code,
               weatherText: desc.text,
