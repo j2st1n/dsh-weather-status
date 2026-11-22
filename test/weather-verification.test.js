@@ -424,14 +424,14 @@ test('Cordis route GET /api/weather/ip handler and /api/weather/health version',
   const ipHandler = routes.get('/api/weather/ip')
   assert.equal(typeof ipHandler, 'function', 'IP handler must be registered')
 
-  // Test method not allowed
+  // Test method not allowed（可信 loopback Host：fence 放行后才会落到方法判定）
   let statusResult = 0
   let jsonResult = null
   const mockRes405 = {
     writeHead: (s) => { statusResult = s },
     end: (body) => { jsonResult = JSON.parse(body) }
   }
-  await ipHandler({ method: 'POST', url: '/api/weather/ip', headers: {} }, mockRes405)
+  await ipHandler({ method: 'POST', url: '/api/weather/ip', headers: { host: '127.0.0.1:3080' } }, mockRes405)
   assert.equal(statusResult, 405)
   assert.equal(jsonResult.ok, false)
 
@@ -443,7 +443,7 @@ test('Cordis route GET /api/weather/ip handler and /api/weather/health version',
     writeHead: (s) => { healthStatus = s },
     end: (body) => { healthJson = JSON.parse(body) }
   }
-  await healthHandler({ method: 'GET', url: '/api/weather/health', headers: {} }, mockHealthRes)
+  await healthHandler({ method: 'GET', url: '/api/weather/health', headers: { host: '127.0.0.1:3080' } }, mockHealthRes)
   assert.equal(healthStatus, 200)
   assert.equal(healthJson.ok, true)
   assert.equal(healthJson.version, '0.1.2')
@@ -515,4 +515,233 @@ test('Hourly day/night weather icon uses is_day and real hour without 20h index 
   const nightDesc = getWeatherDesc(0, isNightHour)
   assert.equal(nightDesc.icon, 'moon', 'Nighttime clear sky on day 2 must show moon icon')
   assert.equal(nightDesc.text, '晴朗 (夜)')
+})
+
+// ==========================================
+// 6. Host/Origin fence（exact 路由不经过宿主准入，路由必须自己拒绝伪造来源）
+// 以下用例全部实际驱动注册的 handler，不启动端口、不断言源码字符串。
+// ==========================================
+
+/** 建一个只记录 status/body 的响应对象，并用给定请求头调用一次 handler。 */
+async function invokeRoute(handler, method, url, headers) {
+  let status = 0
+  let text = ''
+  const res = {
+    writeHead: (s) => { status = s },
+    end: (body = '') => { text += body }
+  }
+  await handler({ method, url, headers }, res)
+  return { status, body: text ? JSON.parse(text) : null }
+}
+
+/** 注册四条路由并返回 path → handler 映射。 */
+function applyAndCollectRoutes(options = {}) {
+  const routes = new Map()
+  serverApply({
+    webServer: {
+      register: (r) => routes.set(r.path, r.handler),
+      host: options.webServerHost ?? '127.0.0.1',
+      protocol: options.webServerProtocol ?? 'http:'
+    },
+    effect: (fn) => fn(),
+    // 真实 DSH 宿主的 ctx.get 对未知服务返回 null（不是 undefined）：
+    // 默认就按这个形态注入，确保 fence 的 null 分支被真实覆盖。
+    get: (name) => (name === 'connection' ? (options.connection ?? null) : null)
+  })
+  return routes
+}
+
+const WEATHER_ROUTES = ['/api/weather/current', '/api/weather/cities', '/api/weather/health', '/api/weather/ip']
+
+test('fence: 伪造 Host / 缺失 Host 的四条只读路由被拒 403', async () => {
+  const routes = applyAndCollectRoutes()
+
+  for (const path of WEATHER_ROUTES) {
+    // DNS rebinding 形态：Origin 与 Host 同为攻击者域名，Origin 自洽也必须被 Host 白名单拒绝。
+    const rebound = await invokeRoute(routes.get(path), 'GET', path, {
+      host: 'evil.example.test:3080',
+      origin: 'http://evil.example.test:3080'
+    })
+    assert.equal(rebound.status, 403, `${path} 必须拒绝伪造 Host`)
+    assert.equal(rebound.body.error.code, 'FORBIDDEN')
+
+    // 完全不带头（非浏览器客户端直连）同样不接受。
+    const noHost = await invokeRoute(routes.get(path), 'GET', path, {})
+    assert.equal(noHost.status, 403, `${path} 必须拒绝缺失 Host`)
+
+    // 形似 loopback 但实为攻击者子域。
+    const lookalike = await invokeRoute(routes.get(path), 'GET', path, { host: '127.0.0.1.evil.example.test' })
+    assert.equal(lookalike.status, 403, `${path} 必须拒绝仿冒 loopback`)
+  }
+})
+
+test('fence: cross-site 请求被拒 403', async () => {
+  const routes = applyAndCollectRoutes()
+
+  for (const path of WEATHER_ROUTES) {
+    // Host 是合法 loopback，仅靠 Sec-Fetch-Site 识别跨站。
+    const crossSite = await invokeRoute(routes.get(path), 'GET', path, {
+      host: '127.0.0.1:3080',
+      'sec-fetch-site': 'cross-site'
+    })
+    assert.equal(crossSite.status, 403, `${path} 必须拒绝 cross-site`)
+    assert.equal(crossSite.body.error.code, 'FORBIDDEN')
+  }
+
+  // 带同源 Origin 也挡不住 cross-site 判定。
+  const both = await invokeRoute(routes.get('/api/weather/health'), 'GET', '/api/weather/health', {
+    host: '127.0.0.1:3080',
+    origin: 'http://127.0.0.1:3080',
+    'sec-fetch-site': 'cross-site'
+  })
+  assert.equal(both.status, 403)
+})
+
+test('fence: 不匹配 Origin 被拒 403', async () => {
+  const routes = applyAndCollectRoutes()
+
+  for (const path of WEATHER_ROUTES) {
+    const foreignOrigin = await invokeRoute(routes.get(path), 'GET', path, {
+      host: '127.0.0.1:3080',
+      origin: 'http://evil.example.test'
+    })
+    assert.equal(foreignOrigin.status, 403, `${path} 必须拒绝跨源 Origin`)
+
+    // 端口不同即不同 authority。
+    const otherPort = await invokeRoute(routes.get(path), 'GET', path, {
+      host: '127.0.0.1:3080',
+      origin: 'http://127.0.0.1:9999'
+    })
+    assert.equal(otherPort.status, 403, `${path} 必须拒绝异端口 Origin`)
+  }
+
+  // 非 http(s) 的 Origin 视为不匹配。
+  const nullOrigin = await invokeRoute(routes.get('/api/weather/health'), 'GET', '/api/weather/health', {
+    host: '127.0.0.1:3080',
+    origin: 'null'
+  })
+  assert.equal(nullOrigin.status, 403)
+})
+
+test('fence: 正常 loopback 请求放行四条路由', async () => {
+  const routes = applyAndCollectRoutes()
+
+  // health 不打上游，可直接断言 200 与既有契约字段。
+  const health = await invokeRoute(routes.get('/api/weather/health'), 'GET', '/api/weather/health', {
+    host: '127.0.0.1:3080'
+  })
+  assert.equal(health.status, 200)
+  assert.equal(health.body.ok, true)
+  assert.equal(health.body.service, 'dsh-weather')
+  assert.equal(health.body.version, '0.1.2')
+  assert.equal(typeof health.body.cachedIpItems, 'number')
+  assert.equal(typeof health.body.timestamp, 'number')
+
+  // localhost 与同源 Origin（默认端口按 Origin 的 scheme 归一化）同样放行。
+  const localhostSameOrigin = await invokeRoute(routes.get('/api/weather/health'), 'GET', '/api/weather/health', {
+    host: 'localhost:3080',
+    origin: 'http://localhost:3080',
+    'sec-fetch-site': 'same-origin'
+  })
+  assert.equal(localhostSameOrigin.status, 200)
+
+  const httpsDefaultPort = await invokeRoute(routes.get('/api/weather/health'), 'GET', '/api/weather/health', {
+    host: 'localhost',
+    origin: 'https://localhost'
+  })
+  assert.equal(httpsDefaultPort.status, 200)
+
+  // 其余三条会打上游（无网络环境不可靠），只断言"没有被 fence 拦下"：
+  // 非 403 即证明来源校验已放行，请求进入了原有业务逻辑。
+  for (const path of ['/api/weather/current', '/api/weather/cities', '/api/weather/ip']) {
+    const res = await invokeRoute(routes.get(path), 'GET', path, { host: '127.0.0.1:3080' })
+    assert.notEqual(res.status, 403, `${path} 不应被 fence 拦截`)
+  }
+})
+
+test('fence: IP 定位在 fence 之后仍读到原始请求头', async () => {
+  const routes = applyAndCollectRoutes()
+
+  // x-forwarded-for 取第一个值；fence 只读头不改 req，语义必须保持。
+  const forwarded = await invokeRoute(routes.get('/api/weather/ip'), 'GET', '/api/weather/ip', {
+    host: '127.0.0.1:3080',
+    'x-forwarded-for': '203.0.113.9, 10.0.0.1',
+    'x-real-ip': '198.51.100.7'
+  })
+  assert.notEqual(forwarded.status, 403, '可信来源不应被 fence 拦截')
+  if (forwarded.status === 200) {
+    assert.equal(forwarded.body.data.ip, '203.0.113.9', 'x-forwarded-for 首值必须原样生效')
+  }
+
+  // 伪造来源时连 IP 探测都不该发生。
+  const forged = await invokeRoute(routes.get('/api/weather/ip'), 'GET', '/api/weather/ip', {
+    host: 'evil.example.test:3080',
+    'x-forwarded-for': '203.0.113.9'
+  })
+  assert.equal(forged.status, 403)
+  assert.equal(forged.body.error.code, 'FORBIDDEN')
+})
+
+test('fence: 监听器 bind 地址与 connection 官方判定同样参与放行', async () => {
+  // bind 到非 loopback 地址时，该地址本身可信。
+  const bindRoutes = applyAndCollectRoutes({ webServerHost: '192.168.1.10' })
+  const bindRes = await invokeRoute(bindRoutes.get('/api/weather/health'), 'GET', '/api/weather/health', {
+    host: '192.168.1.10:3080'
+  })
+  assert.equal(bindRes.status, 200)
+
+  // connection.trustedHosts 中的 Host 可信，其余非 loopback 仍拒绝。
+  const trustedRoutes = applyAndCollectRoutes({ connection: { trustedHosts: ['harness.internal:3080'] } })
+  const trusted = await invokeRoute(trustedRoutes.get('/api/weather/health'), 'GET', '/api/weather/health', {
+    host: 'harness.internal:3080'
+  })
+  assert.equal(trusted.status, 200)
+  const untrusted = await invokeRoute(trustedRoutes.get('/api/weather/health'), 'GET', '/api/weather/health', {
+    host: 'other.internal:3080'
+  })
+  assert.equal(untrusted.status, 403)
+
+  // 宿主提供 isTrusted 时以其判定为准：判否的 loopback 也拒，判可的非 loopback 也放。
+  const officialRoutes = applyAndCollectRoutes({
+    connection: { isTrusted: (req) => req.headers?.host === 'harness.internal:3080' }
+  })
+  const officialReject = await invokeRoute(officialRoutes.get('/api/weather/health'), 'GET', '/api/weather/health', {
+    host: '127.0.0.1:3080'
+  })
+  assert.equal(officialReject.status, 403)
+  const officialAccept = await invokeRoute(officialRoutes.get('/api/weather/health'), 'GET', '/api/weather/health', {
+    host: 'harness.internal:3080'
+  })
+  assert.equal(officialAccept.status, 200)
+
+  // isTrusted 抛错时降级为不可信，不得放行、也不得把异常包成 200。
+  const throwingRoutes = applyAndCollectRoutes({ connection: { isTrusted: () => { throw new Error('boom') } } })
+  const throwing = await invokeRoute(throwingRoutes.get('/api/weather/health'), 'GET', '/api/weather/health', {
+    host: '127.0.0.1:3080'
+  })
+  assert.equal(throwing.status, 403)
+})
+
+test('fence: 非 GET 方法在 fence 之后仍返回 405', async () => {
+  const routes = applyAndCollectRoutes()
+
+  // 可信来源的 POST 落到 handler 内部的方法判定。
+  const trustedPost = await invokeRoute(routes.get('/api/weather/health'), 'POST', '/api/weather/health', {
+    host: '127.0.0.1:3080'
+  })
+  assert.equal(trustedPost.status, 405)
+  assert.equal(trustedPost.body.error.code, 'METHOD_NOT_ALLOWED')
+
+  // 与 opencode 语义一致：fencedRead 只围栏 GET，其余方法由 handler 的方法判定处理
+  // （该分支不返回任何数据，不构成读取面）。
+  const untrustedPost = await invokeRoute(routes.get('/api/weather/health'), 'POST', '/api/weather/health', {
+    host: 'evil.example.test:3080'
+  })
+  assert.equal(untrustedPost.status, 405)
+
+  // 不可信来源的 GET 才是真正的读取面，必须在进入 handler 前被拒。
+  const untrustedGet = await invokeRoute(routes.get('/api/weather/health'), 'GET', '/api/weather/health', {
+    host: 'evil.example.test:3080'
+  })
+  assert.equal(untrustedGet.status, 403)
 })
