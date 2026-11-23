@@ -21,6 +21,17 @@ window.__ModuleLoader__.load({
     const CACHE_TTL_MS = 30 * 60 * 1000 // 30 minutes
     const REQUEST_TIMEOUT_MS = 6000
 
+    // Hover preview card: 220ms matches dsh-link-pulse / dsh-cpa-status so all
+    // sidebar triggers feel like one family of controls.
+    const HOVER_DELAY_MS = 220
+    const HOVER_CARD_MAX_HEIGHT = 220
+    // 极矮视口下宁可把卡片压扁（内部可滚动），也不让它顶出屏幕。
+    const HOVER_CARD_MIN_HEIGHT = 96
+    const HOVER_CARD_RAIL_WIDTH = 264 // rail trigger is only 28px wide
+    const HOVER_CARD_MIN_WIDTH = 200
+    const HOVER_HOURLY_COUNT = 6
+    const HOVER_DAILY_COUNT = 3
+
     const DEFAULT_CITY = {
       name: '北京',
       country: '中国',
@@ -346,6 +357,240 @@ window.__ModuleLoader__.load({
       }
       const Comp = Icons[key] || Icons['cloud']
       return h(Comp)
+    }
+
+    // ---------- Hover Preview Layout ----------
+    // Geometry only — the card never fetches, so a stale cache is still worth showing.
+    // Returns where to pop the card and how tall it may grow, so a short viewport or a
+    // trigger parked near the bottom edge can never push the card off screen.
+    function computeHoverLayout(triggerEl, wide) {
+      const vw = (typeof window !== 'undefined' && Number.isFinite(window.innerWidth) && window.innerWidth) || 1280
+      const vh = (typeof window !== 'undefined' && Number.isFinite(window.innerHeight) && window.innerHeight) || 800
+      const margin = 8
+      const gap = 6
+
+      let rect = null
+      try {
+        rect = triggerEl && typeof triggerEl.getBoundingClientRect === 'function'
+          ? triggerEl.getBoundingClientRect()
+          : null
+      } catch {}
+      if (!rect) rect = {}
+
+      const top = Number.isFinite(rect.top) ? rect.top : vh / 2
+      const bottom = Number.isFinite(rect.bottom) ? rect.bottom : top
+      const left = Number.isFinite(rect.left) ? rect.left : margin
+
+      const spaceAbove = Math.max(0, top - margin - gap)
+      const spaceBelow = Math.max(0, vh - bottom - margin - gap)
+      const direction = spaceAbove >= spaceBelow ? 'up' : 'down'
+      const room = direction === 'up' ? spaceAbove : spaceBelow
+      const maxHeight = Math.max(
+        HOVER_CARD_MIN_HEIGHT,
+        Math.min(HOVER_CARD_MAX_HEIGHT, Math.floor(room))
+      )
+
+      // 宽版：侧栏列本身有 overflow: hidden，卡片只要贴合侧栏内容宽度就不会被裁切。
+      if (wide) {
+        return {
+          direction,
+          maxHeight,
+          style: direction === 'down'
+            ? { position: 'absolute', left: 0, right: 0, top: 'calc(100% + 6px)' }
+            : { position: 'absolute', left: 0, right: 0, bottom: 'calc(100% + 6px)' }
+        }
+      }
+
+      // 折叠 rail：触发器只有 ~28px 宽，而且侧栏列 overflow: hidden 会裁掉超出列宽的内容，
+      // 所以卡片改用 position: fixed 钉在视口坐标上：宽度自己定，既不跟随 28px 触发器，
+      // 也不会被 56px 的侧栏列裁成一条。
+      const width = Math.max(
+        HOVER_CARD_MIN_WIDTH,
+        Math.min(HOVER_CARD_RAIL_WIDTH, Math.floor(vw - margin * 2))
+      )
+      const cardLeft = Math.min(
+        Math.max(left, margin),
+        Math.max(margin, vw - margin - width)
+      )
+      return {
+        direction,
+        maxHeight,
+        style: direction === 'down'
+          ? { position: 'fixed', left: cardLeft, width, top: Math.round(bottom + gap) }
+          : { position: 'fixed', left: cardLeft, width, bottom: Math.round(vh - top + gap) }
+      }
+    }
+
+    // ---------- Hover Preview Card (read-only, cache-backed) ----------
+    // Rendered synchronously from the any-format store cache: no fetch, no timers,
+    // no side effects. Three blocks ordered by decision value:
+    //   ① how it feels now (temp vs apparent temp + humidity / wind / rain)
+    //   ② the next 6 hours (so temperature drift is obvious at a glance)
+    //   ③ the next 3 days
+    function renderWeatherHoverCard(props) {
+      const { data, layout, cityName, weatherText, weatherIcon, isDay, currentTemp, apparentTemp } = props
+      const weather = data && data.weather ? data.weather : null
+      const cur = weather && weather.current ? weather.current : null
+      const hourly = Array.isArray(weather && weather.hourly) ? weather.hourly.slice(0, HOVER_HOURLY_COUNT) : []
+      const daily = Array.isArray(weather && weather.daily) ? weather.daily.slice(0, HOVER_DAILY_COUNT) : []
+
+      // 定位完全由 computeHoverLayout 决定（宽版 absolute 贴侧栏 / rail 版 fixed 钉视口）。
+      const placement = layout && layout.style ? layout.style : {
+        position: 'absolute',
+        left: 0,
+        right: 0,
+        bottom: 'calc(100% + 6px)'
+      }
+
+      const sectionStyle = {
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 3,
+        borderTop: `1px dashed ${T.border}`,
+        paddingTop: 4
+      }
+      const sectionTitleStyle = { fontSize: 10, lineHeight: '11px', color: T.labelDim }
+      const metricStyle = { display: 'flex', alignItems: 'center', gap: 3, whiteSpace: 'nowrap' }
+      const metricValue = (value, unit) => `${value === null || value === undefined || value === '' ? '--' : value}${unit}`
+
+      return h('div', {
+        className: 'dsh-weather-hover-card dsh-weather-panel-enter dsh-weather-scroll',
+        style: {
+          ...placement,
+          maxHeight: layout.maxHeight,
+          maxWidth: 'calc(100vw - 16px)',
+          overflowY: 'auto',
+          overflowX: 'hidden',
+          background: T.bgPanel,
+          backdropFilter: 'blur(20px)',
+          WebkitBackdropFilter: 'blur(20px)',
+          border: `1px solid ${T.border2}`,
+          borderRadius: 12,
+          boxShadow: T.shadow,
+          padding: '8px 10px',
+          boxSizing: 'border-box',
+          display: 'flex',
+          flexDirection: 'column',
+          gap: 4,
+          color: T.label,
+          fontSize: 11,
+          lineHeight: 1.35,
+          zIndex: 100,
+          // 纯预览：不吃指针事件，指针一旦离开触发器就立刻收起，也不会挡住下面的会话区。
+          pointerEvents: 'none',
+          fontFamily: 'system-ui, -apple-system, sans-serif'
+        }
+      }, [
+        // ① 体感与环境
+        h('div', { key: 'now', style: { display: 'flex', flexDirection: 'column', gap: 3 } }, [
+          h('div', { style: { display: 'flex', alignItems: 'center', gap: 5, minWidth: 0 } }, [
+            h('div', { style: { width: 16, height: 16, display: 'flex', flexShrink: 0 } },
+              renderWeatherIcon(weatherIcon, isDay)),
+            h('span', {
+              style: {
+                fontSize: 12,
+                fontWeight: 600,
+                color: T.label,
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+                whiteSpace: 'nowrap'
+              }
+            }, cityName),
+            h('span', { style: { fontSize: 11, color: T.labelSec, whiteSpace: 'nowrap', flexShrink: 0 } }, weatherText)
+          ]),
+          h('div', { style: { display: 'flex', alignItems: 'baseline', gap: 8 } }, [
+            h('span', {
+              style: { fontSize: 20, fontWeight: 600, lineHeight: '20px', fontVariantNumeric: 'tabular-nums' }
+            }, currentTemp),
+            h('span', {
+              style: {
+                fontSize: 10,
+                color: T.labelSec,
+                padding: '1px 5px',
+                borderRadius: 4,
+                background: T.bgSubtle
+              }
+            }, `体感 ${apparentTemp}`)
+          ]),
+          h('div', {
+            style: {
+              display: 'flex',
+              alignItems: 'center',
+              gap: 8,
+              flexWrap: 'wrap',
+              fontSize: 10,
+              color: T.labelSec
+            }
+          }, [
+            h('span', { key: 'humidity', style: metricStyle }, [
+              h('span', { style: { display: 'flex', color: '#0ea5e9' } }, h(Icons.humidity)),
+              `湿度 ${metricValue(cur && cur.humidity, '%')}`
+            ]),
+            h('span', { key: 'wind', style: metricStyle }, [
+              h('span', { style: { display: 'flex', color: '#38bdf8' } }, h(Icons.wind)),
+              `风速 ${metricValue(cur && cur.windSpeed, ' km/h')}`
+            ]),
+            h('span', { key: 'precip', style: metricStyle }, [
+              h('span', { style: { display: 'flex', color: '#3b82f6' } }, h(Icons.droplet)),
+              `降水 ${metricValue(cur && cur.precipitation, ' mm')}`
+            ])
+          ])
+        ]),
+
+        // ② 逐小时趋势
+        hourly.length > 0 && h('div', { key: 'hourly', style: sectionStyle }, [
+          h('div', { style: sectionTitleStyle }, '逐小时趋势'),
+          h('div', {
+            style: { display: 'flex', alignItems: 'flex-end', justifyContent: 'space-between', gap: 2 }
+          }, hourly.map((item, idx) => h('div', {
+            key: `hour${idx}`,
+            style: {
+              flex: '1 1 0',
+              minWidth: 0,
+              display: 'flex',
+              flexDirection: 'column',
+              alignItems: 'center',
+              gap: 1
+            }
+          }, [
+            h('span', { style: { fontSize: 9, color: T.labelDim, whiteSpace: 'nowrap' } }, item.time),
+            h('div', { style: { width: 14, height: 14, display: 'flex' } },
+              renderWeatherIcon(item.icon, true)),
+            h('span', {
+              style: { fontSize: 11, fontWeight: 600, color: T.label, fontVariantNumeric: 'tabular-nums' }
+            }, `${Math.round(item.temperature)}°`)
+          ])))
+        ]),
+
+        // ③ 未来三天
+        daily.length > 0 && h('div', { key: 'daily', style: sectionStyle }, [
+          h('div', { style: sectionTitleStyle }, '未来三天'),
+          ...daily.map((item, idx) => h('div', {
+            key: `day${idx}`,
+            style: { display: 'flex', alignItems: 'center', gap: 6, fontSize: 11 }
+          }, [
+            h('span', {
+              style: { width: 28, flexShrink: 0, fontWeight: 500, color: T.label }
+            }, item.weekday),
+            h('div', { style: { width: 13, height: 13, display: 'flex', flexShrink: 0 } },
+              renderWeatherIcon(item.icon, true)),
+            h('span', {
+              style: {
+                flex: 1,
+                minWidth: 0,
+                fontSize: 10,
+                color: T.labelSec,
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+                whiteSpace: 'nowrap'
+              }
+            }, item.weatherText),
+            h('span', {
+              style: { flexShrink: 0, color: T.label, fontVariantNumeric: 'tabular-nums' }
+            }, `${item.tempMin}° / ${item.tempMax}°`)
+          ]))
+        ])
+      ])
     }
 
     // ---------- Global Store for Sync ----------
@@ -731,6 +976,12 @@ window.__ModuleLoader__.load({
       const state = useStore()
       const capsuleRef = useRef(null)
       const { data, loading, panelState } = state
+      const [hovering, setHovering] = useState(false)
+      const [hoverLayout, setHoverLayout] = useState(null)
+      const hoverTimerRef = useRef(null)
+      // 'closing' counts as active too: the exit animation still owns the screen,
+      // and a card popping up behind it would look like a glitch.
+      const isPanelActive = panelState === 'open' || panelState === 'closing'
 
       useEffect(() => {
         fetchWeatherData(false)
@@ -738,9 +989,40 @@ window.__ModuleLoader__.load({
         return () => clearInterval(timer)
       }, [])
 
+      // Never leave a pending hover timer behind: on unmount React drops the mouse
+      // listeners itself, but the timer would still fire into a dead component.
+      useEffect(() => () => {
+        clearTimeout(hoverTimerRef.current)
+      }, [])
+
+      // The main panel takes over as soon as it opens; drop the hover card first.
+      useEffect(() => {
+        if (isPanelActive) {
+          clearTimeout(hoverTimerRef.current)
+          setHovering(false)
+        }
+      }, [isPanelActive])
+
       const handleClick = useCallback((e) => {
         if (e && e.stopPropagation) e.stopPropagation()
+        clearTimeout(hoverTimerRef.current)
+        setHovering(false)
         togglePanel()
+      }, [])
+
+      const handleMouseEnter = useCallback((e) => {
+        if (isPanelActive) return
+        const triggerEl = e && e.currentTarget
+        clearTimeout(hoverTimerRef.current)
+        hoverTimerRef.current = setTimeout(() => {
+          setHoverLayout(computeHoverLayout(triggerEl, wide))
+          setHovering(true)
+        }, HOVER_DELAY_MS)
+      }, [isPanelActive, wide])
+
+      const handleMouseLeave = useCallback(() => {
+        clearTimeout(hoverTimerRef.current)
+        setHovering(false)
       }, [])
 
       const isOpen = panelState === 'open'
@@ -754,14 +1036,47 @@ window.__ModuleLoader__.load({
 
       const tooltipText = `${cityName} · ${weatherText} ${currentTemp} (体感 ${apparentTemp})`
 
+      // Hover preview is strictly a read of the store cache: no refresh, no freshness
+      // check. Skip it entirely when the panel is up or there is nothing cached yet.
+      const hasPreviewData = Boolean(cur) || Boolean(data?.weather?.hourly?.length)
+      const hoverCardNode = hovering && !isPanelActive && hasPreviewData
+        ? renderWeatherHoverCard({
+          data,
+          layout: hoverLayout || computeHoverLayout(null, wide),
+          cityName,
+          weatherText,
+          weatherIcon,
+          isDay,
+          currentTemp,
+          apparentTemp
+        })
+        : null
+
+      const withHoverCard = (node) => {
+        if (!hoverCardNode) return node
+        return h(
+          'div',
+          {
+            className: 'dsh-weather-hover-wrap',
+            style: { position: 'relative', width: '100%' },
+            onMouseEnter: handleMouseEnter,
+            onMouseLeave: handleMouseLeave
+          },
+          [node, hoverCardNode]
+        )
+      }
+
       // Wide mode
       if (wide) {
-        return h(
+        return withHoverCard(h(
           'div',
           {
             ref: capsuleRef,
             onClick: handleClick,
-            title: tooltipText,
+            onMouseEnter: handleMouseEnter,
+            onMouseLeave: handleMouseLeave,
+            // 卡片已经展示了同样的信息，再把原生 title 浮出会盖住卡片。
+            title: hoverCardNode ? undefined : tooltipText,
             className: 'dsh-weather-capsule',
             style: {
               height: 28,
@@ -854,16 +1169,18 @@ window.__ModuleLoader__.load({
               }
             })
           ]
-        )
+        ))
       }
 
       // Rail mode (wide === false)
-      return h(
+      return withHoverCard(h(
         'div',
         {
           ref: capsuleRef,
           onClick: handleClick,
-          title: tooltipText,
+          onMouseEnter: handleMouseEnter,
+          onMouseLeave: handleMouseLeave,
+          title: hoverCardNode ? undefined : tooltipText,
           className: 'dsh-weather-capsule',
           style: {
             width: 28,
@@ -904,7 +1221,7 @@ window.__ModuleLoader__.load({
             }
           })
         ]
-      )
+      ))
     }
 
     // ---------- Component: Overlay Detail Panel ----------

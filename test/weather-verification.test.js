@@ -745,3 +745,401 @@ test('fence: 非 GET 方法在 fence 之后仍返回 405', async () => {
   })
   assert.equal(untrustedGet.status, 403)
 })
+
+// ==========================================
+// 5. Sidebar hover preview card (220ms, cache-only)
+// ==========================================
+// 侧栏触发器悬停 220ms 后的预览卡片。测试用「假 React hooks 运行时」直接驱动
+// WeatherCapsule：定时器被替换成可手动触发的记录器，因此能精确断言 220ms 延迟、
+// 卸载清理，以及卡片内容确实来自 localStorage 缓存（fetch 被替换成计数器）。
+
+const HOVER_HOURLY_TIMES = ['现在', '15:00', '16:00', '17:00', '18:00', '19:00', '20:00', '21:00']
+
+function makeHoverCache() {
+  const now = Date.now()
+  return {
+    timestamp: now,
+    expiresAt: now + 60 * 60 * 1000, // 新鲜缓存：挂载时的 fetchWeatherData 直接短路
+    city: { name: '杭州', country: '中国', latitude: 30.2741, longitude: 120.1551, isAutoIp: true },
+    weather: {
+      current: {
+        temperature: 18.4,
+        apparentTemperature: 16.2,
+        humidity: 63,
+        weatherCode: 2,
+        weatherText: '多云',
+        icon: 'cloud-sun',
+        isDay: true,
+        windSpeed: 12.5,
+        precipitation: 0.2
+      },
+      hourly: HOVER_HOURLY_TIMES.map((time, i) => ({
+        time,
+        isoTime: `2026-11-23T${String(14 + i).padStart(2, '0')}:00`,
+        temperature: 18 - i,
+        weatherCode: 2,
+        weatherText: '多云',
+        icon: 'cloud-sun',
+        precipitationProbability: 20
+      })),
+      daily: [
+        { date: '2026-11-23', weekday: '今天', weatherCode: 2, weatherText: '多云', icon: 'cloud-sun', tempMax: 20, tempMin: 12 },
+        { date: '2026-11-24', weekday: '明天', weatherCode: 3, weatherText: '阴天', icon: 'cloud', tempMax: 19, tempMin: 10 },
+        { date: '2026-11-25', weekday: '周三', weatherCode: 61, weatherText: '小雨', icon: 'rain', tempMax: 17, tempMin: 9 },
+        { date: '2026-11-26', weekday: '周四', weatherCode: 71, weatherText: '小雪', icon: 'snow', tempMax: 5, tempMin: -1 },
+        { date: '2026-11-27', weekday: '周五', weatherCode: 0, weatherText: '晴朗', icon: 'sun', tempMax: 8, tempMin: 0 }
+      ]
+    }
+  }
+}
+
+function fakeTrigger(rect = {}) {
+  const top = rect.top ?? 700
+  const height = rect.height ?? 28
+  const left = rect.left ?? 10
+  const width = rect.width ?? 28
+  return {
+    getBoundingClientRect: () => ({
+      top,
+      bottom: top + height,
+      left,
+      right: left + width,
+      width,
+      height
+    })
+  }
+}
+
+// Track 的 vnode 子节点可能被渲染成「数组里的数组」，这里摊平一层。
+function vnodeChildren(node) {
+  if (!node || !Array.isArray(node.children)) return []
+  const flat = []
+  for (const child of node.children) {
+    if (Array.isArray(child)) flat.push(...child)
+    else flat.push(child)
+  }
+  return flat
+}
+
+function collectText(node) {
+  const parts = []
+  const walk = (n) => {
+    if (n === null || n === undefined || typeof n === 'boolean') return
+    if (typeof n === 'string' || typeof n === 'number') {
+      parts.push(String(n))
+      return
+    }
+    if (Array.isArray(n)) {
+      for (const child of n) walk(child)
+      return
+    }
+    if (typeof n === 'object') {
+      for (const child of (n.children || [])) walk(child)
+    }
+  }
+  walk(node)
+  return parts.join(' | ')
+}
+
+function createHoverHarness(options = {}) {
+  const cache = options.cache || makeHoverCache()
+  const fetchCalls = []
+  const scheduled = []
+  const cleared = []
+  let timerSeq = 0
+
+  const saved = {
+    window: globalThis.window,
+    document: globalThis.document,
+    fetch: globalThis.fetch,
+    setTimeout: globalThis.setTimeout,
+    clearTimeout: globalThis.clearTimeout
+  }
+
+  const loaded = { bundle: null }
+  globalThis.window = {
+    __ModuleLoader__: { load: (bundle) => { loaded.bundle = bundle } },
+    localStorage: {
+      getItem: (key) => (key === 'dsh_weather_cache_v1' ? JSON.stringify(cache) : null),
+      setItem: () => {}
+    },
+    innerWidth: options.innerWidth ?? 1280,
+    innerHeight: options.innerHeight ?? 800,
+    addEventListener: () => {},
+    removeEventListener: () => {}
+  }
+  globalThis.document = {
+    createElement: (tag) => ({ tag, style: {}, id: '', textContent: '', remove: () => {} }),
+    head: { appendChild: () => {} },
+    querySelector: () => null
+  }
+  globalThis.fetch = (url) => {
+    fetchCalls.push(String(url))
+    return Promise.reject(new Error('network disabled in hover preview test'))
+  }
+  globalThis.setTimeout = (fn, delay) => {
+    const id = ++timerSeq
+    scheduled.push({ id, fn, delay })
+    return id
+  }
+  globalThis.clearTimeout = (id) => {
+    cleared.push(id)
+  }
+
+  eval(fs.readFileSync(path.join(pluginRoot, 'src/client.js'), 'utf8'))
+  assert.ok(loaded.bundle, 'client bundle must register via __ModuleLoader__')
+
+  const hooks = { stateCells: [], refCells: [], effects: [], cursor: 0 }
+  const reactMock = {
+    createElement: (type, props, ...children) => ({ type, props: props || {}, children }),
+    useEffect: (fn) => { hooks.effects.push(fn) },
+    useState: (initial) => {
+      const idx = hooks.cursor++
+      if (!hooks.stateCells[idx]) {
+        hooks.stateCells[idx] = { value: typeof initial === 'function' ? initial() : initial }
+      }
+      const cell = hooks.stateCells[idx]
+      const set = (next) => { cell.value = typeof next === 'function' ? next(cell.value) : next }
+      return [cell.value, set]
+    },
+    useRef: (initial) => {
+      const idx = hooks.cursor++
+      if (!hooks.refCells[idx]) hooks.refCells[idx] = { current: initial }
+      return hooks.refCells[idx]
+    },
+    useSyncExternalStore: (subscribe, getSnapshot) => getSnapshot(),
+    useCallback: (fn) => fn
+  }
+
+  const clientExports = loaded.bundle.factory((modName) => {
+    if (modName === 'react') return reactMock
+    throw new Error('Unknown module: ' + modName)
+  })
+  const registeredSlots = []
+  clientExports.apply({
+    effect: (fn) => fn(),
+    slots: {
+      inject: (name, callback) => callback(),
+      register: (slotOptions, componentFactory) => { registeredSlots.push({ options: slotOptions, componentFactory }) }
+    }
+  })
+  const sidebarSlot = registeredSlots.find((slot) => slot.options.name === 'sidebar.footer.action')
+  assert.ok(sidebarSlot, 'sidebar.footer.action must be registered')
+
+  return {
+    fetchCalls,
+    scheduled,
+    cleared,
+    render(wide) {
+      hooks.cursor = 0
+      hooks.effects = []
+      const element = sidebarSlot.componentFactory({ wide })
+      return element.type(element.props)
+    },
+    runEffects() {
+      return hooks.effects.map((fn) => fn())
+    },
+    restore() {
+      globalThis.window = saved.window
+      globalThis.document = saved.document
+      globalThis.fetch = saved.fetch
+      globalThis.setTimeout = saved.setTimeout
+      globalThis.clearTimeout = saved.clearTimeout
+    }
+  }
+}
+
+test('hover preview: 悬停 220ms 后从缓存弹出三块卡片，移出即消失且不发请求', () => {
+  const harness = createHoverHarness()
+  const cleanups = []
+  try {
+    // rail 触发器：28px 宽
+    const first = harness.render(false)
+    assert.equal(first.props.className, 'dsh-weather-capsule')
+    assert.equal(first.props.style.width, 28)
+    assert.equal(typeof first.props.onMouseEnter, 'function', '触发器必须挂 onMouseEnter')
+    assert.equal(typeof first.props.onMouseLeave, 'function', '触发器必须挂 onMouseLeave')
+    assert.equal(first.props.title, '杭州 · 多云 18° (体感 16°)', '未悬停时保留原生 title 提示')
+    assert.equal(harness.scheduled.length, 0, '未悬停时不得提前弹出')
+
+    // 挂载副作用（新鲜缓存 → 不发请求）
+    cleanups.push(...harness.runEffects())
+    assert.equal(harness.fetchCalls.length, 0, '新鲜缓存挂载时不应发请求')
+
+    first.props.onMouseEnter({ currentTarget: fakeTrigger() })
+    assert.equal(harness.scheduled.length, 1)
+    assert.equal(harness.scheduled[0].delay, 220, '悬停延迟必须是 220ms')
+
+    harness.scheduled[0].fn() // 220ms 到点
+    const second = harness.render(false)
+    assert.equal(second.props.className, 'dsh-weather-hover-wrap')
+    assert.equal(second.props.style.position, 'relative', '卡片定位需要 relative 包裹层')
+    assert.equal(typeof second.props.onMouseLeave, 'function')
+
+    const [triggerNode, card] = vnodeChildren(second)
+    assert.equal(triggerNode.props.className, 'dsh-weather-capsule')
+    assert.equal(triggerNode.props.title, undefined, '卡片显示时抑制原生 title，避免叠在卡片上')
+    assert.ok(card, '悬停后必须渲染预览卡片')
+    assert.ok(card.props.className.includes('dsh-weather-hover-card'))
+    // 侧栏列 overflow: hidden 会裁掉超出列宽的内容，rail 卡片必须用 fixed 钉在视口上。
+    assert.equal(card.props.style.position, 'fixed')
+    assert.equal(card.props.style.bottom, 106, '卡片底边应在触发器上方 6px（800 - 700 + 6）')
+    assert.equal(card.props.style.top, undefined)
+    assert.equal(card.props.style.maxHeight, 220, '卡片高度上限 220px')
+    assert.equal(card.props.style.overflowY, 'auto', '空间不足时必须可滚动')
+    assert.equal(card.props.style.width, 264, 'rail 28px 触发器不得把卡片挤成竖条')
+    assert.equal(card.props.style.left, 10)
+
+    const text = collectText(card)
+    // ① 体感与环境
+    for (const expected of ['杭州', '多云', '18°', '体感 16°', '湿度 63%', '风速 12.5 km/h', '降水 0.2 mm']) {
+      assert.ok(text.includes(expected), `卡片缺少「${expected}」，实际内容：${text}`)
+    }
+    // ② 逐小时趋势：只取接下来 6 条
+    assert.ok(text.includes('逐小时趋势'))
+    for (const time of ['现在', '15:00', '16:00', '17:00', '18:00', '19:00']) {
+      assert.ok(text.includes(time), `逐小时缺少 ${time}`)
+    }
+    assert.ok(!text.includes('20:00'), '逐小时最多取 6-8 条，不应渲染第 7 条')
+    // ③ 未来三天
+    assert.ok(text.includes('未来三天'))
+    for (const expected of ['今天', '明天', '周三', '12° / 20°']) {
+      assert.ok(text.includes(expected), `未来三天缺少「${expected}」`)
+    }
+    assert.ok(!text.includes('周四'), '未来三天只渲染daily前三项')
+
+    // 移出即消失
+    second.props.onMouseLeave()
+    const third = harness.render(false)
+    assert.equal(third.props.className, 'dsh-weather-capsule', '移出后卡片必须消失')
+
+    assert.equal(harness.fetchCalls.length, 0, '悬停预览全程禁止发网络请求')
+  } finally {
+    for (const cleanup of cleanups) {
+      if (typeof cleanup === 'function') cleanup()
+    }
+    harness.restore()
+  }
+})
+
+test('hover preview: 宽版卡片贴合侧栏宽度，靠近视口顶部时改为向下弹出', () => {
+  const harness = createHoverHarness()
+  try {
+    const first = harness.render(true)
+    assert.equal(first.props.style.width, '100%')
+
+    first.props.onMouseEnter({ currentTarget: fakeTrigger({ top: 20, left: 8, width: 240 }) })
+    assert.equal(harness.scheduled[0].delay, 220)
+    harness.scheduled[0].fn()
+
+    const second = harness.render(true)
+    const [triggerNode, card] = vnodeChildren(second)
+    assert.equal(triggerNode.props.className, 'dsh-weather-capsule')
+    assert.equal(card.props.style.position, 'absolute')
+    assert.equal(card.props.style.left, 0)
+    assert.equal(card.props.style.right, 0, '宽版卡片贴合侧栏宽度')
+    assert.equal(card.props.style.width, undefined, '宽版不写死像素宽度')
+    assert.equal(card.props.style.top, 'calc(100% + 6px)', '上方空间不足时向下弹出')
+    assert.equal(card.props.style.bottom, undefined)
+    assert.equal(card.props.style.maxHeight, 220)
+  } finally {
+    harness.restore()
+  }
+})
+
+test('hover preview: 视口较矮时按可用空间收紧 maxHeight，不溢出屏幕', () => {
+  const harness = createHoverHarness({ innerHeight: 300 })
+  try {
+    const first = harness.render(false)
+    first.props.onMouseEnter({ currentTarget: fakeTrigger({ top: 200 }) })
+    harness.scheduled[0].fn()
+
+    const [, card] = vnodeChildren(harness.render(false))
+    // 上方可用 = 200 - 8(margin) - 6(gap) = 186
+    assert.equal(card.props.style.maxHeight, 186)
+    assert.equal(card.props.style.position, 'fixed')
+    assert.equal(card.props.style.bottom, 106)
+  } finally {
+    harness.restore()
+  }
+})
+
+test('hover preview: 窄窗口下 rail 卡片横向夹紧在视口内', () => {
+  const harness = createHoverHarness({ innerWidth: 300 })
+  try {
+    const first = harness.render(false)
+    first.props.onMouseEnter({ currentTarget: fakeTrigger({ top: 700, left: 250 }) })
+    harness.scheduled[0].fn()
+
+    const [, card] = vnodeChildren(harness.render(false))
+    const width = card.props.style.width
+    const left = card.props.style.left
+    assert.equal(card.props.style.position, 'fixed')
+    assert.ok(width <= 300 - 16, `卡片宽度 ${width} 不得超过视口可用宽度`)
+    assert.ok(left >= 8, `卡片左边缘 ${left} 不得超过视口左边距`)
+    assert.ok(left + width <= 300 - 8, `卡片右边缘 ${left + width} 不得超出视口`)
+  } finally {
+    harness.restore()
+  }
+})
+
+test('hover preview: 主面板 open/closing 期间不显示卡片，点击行为不变', () => {
+  const harness = createHoverHarness()
+  try {
+    let vnode = harness.render(true)
+    assert.equal(vnode.props.className, 'dsh-weather-capsule')
+
+    // 点击打开面板（既有行为）
+    vnode.props.onClick({ stopPropagation: () => {} })
+    vnode = harness.render(true)
+    assert.equal(vnode.props.className, 'dsh-weather-capsule', '面板打开时不得包悬停卡片')
+    assert.ok(vnodeChildren(vnode)[3], '面板打开后触发器应显示选中指示点')
+    vnode.props.onMouseEnter({ currentTarget: fakeTrigger() })
+    assert.equal(
+      harness.scheduled.filter((t) => t.delay === 220).length,
+      0,
+      'panelState === open 时不得启动悬停定时器'
+    )
+
+    // 再次点击进入 closing：退出动画期间同样不显示卡片
+    vnode.props.onClick({ stopPropagation: () => {} })
+    vnode = harness.render(true)
+    assert.equal(vnode.props.className, 'dsh-weather-capsule', 'closing 期间同样不得显示卡片')
+    assert.equal(vnodeChildren(vnode)[3], false, 'closing 时 isOpen 已为 false')
+    vnode.props.onMouseEnter({ currentTarget: fakeTrigger() })
+    assert.equal(
+      harness.scheduled.filter((t) => t.delay === 220).length,
+      0,
+      'panelState === closing 时不得启动悬停定时器'
+    )
+    assert.equal(harness.fetchCalls.length, 0)
+  } finally {
+    harness.restore()
+  }
+})
+
+test('hover preview: 卸载时清除待触发的悬停定时器', () => {
+  const harness = createHoverHarness()
+  let cleanups = []
+  try {
+    const vnode = harness.render(true)
+    vnode.props.onMouseEnter({ currentTarget: fakeTrigger() })
+    const hoverTimer = harness.scheduled.find((t) => t.delay === 220)
+    assert.ok(hoverTimer, '悬停必须安排 220ms 定时器')
+
+    cleanups = harness.runEffects()
+    for (const cleanup of cleanups) {
+      if (typeof cleanup === 'function') cleanup()
+    }
+
+    assert.ok(harness.cleared.includes(hoverTimer.id), '卸载清理必须 clearTimeout 悬停定时器')
+    assert.equal(harness.fetchCalls.length, 0)
+  } finally {
+    for (const cleanup of cleanups) {
+      if (typeof cleanup === 'function') {
+        try { cleanup() } catch {}
+      }
+    }
+    harness.restore()
+  }
+})
